@@ -1,0 +1,376 @@
+return {
+    on = {
+        timer = {
+            'every 1 minutes'
+        }
+    },
+    logging = {
+        level = domoticz.LOG_INFO,
+        marker = 'SEMS_PLUS'
+    },
+    execute = function(domoticz, item)
+
+        -- =====================================================================
+        -- CONFIGURATIE
+        -- =====================================================================
+        local semsUser     = 'user@sems' -- email van Goodwe-sems gebruiker
+        local semsPassword = 'password_of_user' -- wachtwoord van Goodwe-sems gebruiker
+        local saveFilePath = '/opt/domoticz/userdata/sems_data.json' -- de json wordt opgeslagen voor diagnose -- in dit geval een docker locatie
+        local telemetryFilePath = '/opt/domoticz/userdata/sems_telemetry.json' -- de json wordt opgeslagen voor diagnose -- in dit geval een docker locatie
+        local inverterSN   = '999999DSN99CR9999' -- fallback als sn niet in de lijst staat
+
+        local numStrings = 2 -- aantal aangesloten strings/MPPT's
+
+        local skipMainWhenZero = false -- true = ook vermogen/temperatuur overslaan bij 0
+
+        -- IDX NUMMERS de hier gebruikte IDX nummers corresponderen met bestaande IDX nummers aangemaakt met een plugin
+        local idxOutputPower  = 2107 -- Inverter output power (kWh)
+        local idxTemperatuur  = 2104
+        local idxState        = 2108 -- Selector switch
+
+        local idxOutputVolt   = 2106
+        local idxOutputAmp    = 2105
+        local idxFrequency    = 2121
+
+        local strings = {
+            { volt = 2109, amp = 2110, power = 2111 },
+            { volt = 2112, amp = 2113, power = 2118 },
+            { volt = 2114, amp = 2115, power = 2119 },
+            { volt = 2116, amp = 2117, power = 2120 },
+        }
+
+        -- Mogelijke veldnamen in de SEMS+ JSON (pas aan op basis van sems_data.json)
+        local candidates = {
+            outVolt = { 'vac1', 'vac', 'uac1', 'outputVoltage', 'acVoltage', 'vAc' },
+            outAmp  = { 'iac1', 'iac', 'outputCurrent', 'acCurrent', 'iAc' },
+            freq    = { 'fac1', 'fac', 'frequency', 'acFrequency', 'fAc' },
+            total   = { 'proTotal', 'eTotal', 'etotal', 'totalPower', 'totalYield', 'pvTotalGeneration' },
+        }
+        for n = 1, 4 do
+            candidates['volt' .. n]  = { 'mppt-' .. n .. ':vpv', 'vpv' .. n, 'pv' .. n .. 'Voltage', 'mppt' .. n .. 'Voltage', 'vPv' .. n, 'uPv' .. n }
+            candidates['amp' .. n]   = { 'mppt-' .. n .. ':ipv', 'ipv' .. n, 'pv' .. n .. 'Current', 'mppt' .. n .. 'Current', 'iPv' .. n }
+            candidates['power' .. n] = { 'mppt-' .. n .. ':ppv', 'ppv' .. n, 'pv' .. n .. 'Power', 'mppt' .. n .. 'Power', 'pPv' .. n }
+        end
+        -- =====================================================================
+
+        local baseUrl  = 'https://eu-gateway.semsportal.com'
+        local loginUrl = baseUrl .. '/web/sems/sems-user/api/v1/auth/cross-login'
+        local dataUrl  = baseUrl .. '/web/sems/sems-plant/api/web/device/centralized/page'
+
+        -- ---------------------------------------------------------------------
+        -- Hulpfuncties
+        -- ---------------------------------------------------------------------
+        local function toNum(v)
+            if type(v) == 'number' then return v end
+            if type(v) == 'string' then
+                local m = v:match('-?%d+%.?%d*')
+                return m and tonumber(m) or nil
+            end
+            return nil
+        end
+
+        -- Zoekt (case-insensitive, ook in geneste tabellen) naar een sleutel
+        local function findKey(tbl, name, depth)
+            depth = depth or 0
+            if type(tbl) ~= 'table' or depth > 4 then return nil end
+            local lname = name:lower()
+            for k, v in pairs(tbl) do
+                if type(k) == 'string' and k:lower() == lname then
+                    local num = toNum(v)
+                    if num ~= nil then return num end
+                end
+            end
+            for _, v in pairs(tbl) do
+                if type(v) == 'table' then
+                    local r = findKey(v, name, depth + 1)
+                    if r ~= nil then return r end
+                end
+            end
+            return nil
+        end
+
+        local missing = {}
+        local function getValue(dev, key)
+            if type(dev) ~= 'table' then return nil end
+            for _, name in ipairs(candidates[key]) do
+                local v = findKey(dev, name)
+                if v ~= nil then return v end
+            end
+            missing[#missing + 1] = key
+            return nil
+        end
+
+        -- Update device op basis van type; sla over bij nil / <= 0
+        local function updateDevice(idx, value, label)
+            if not idx then return end
+            if value == nil or value <= 0 then return end
+            local d = domoticz.devices(idx)
+            if not d then
+                domoticz.log('Device idx ' .. tostring(idx) .. ' (' .. label .. ') bestaat niet.', domoticz.LOG_ERROR)
+                return
+            end
+            local sub = d.deviceSubType or ''
+            if sub == 'Voltage' then
+                d.updateVoltage(value)
+            elseif sub == 'Current (Single)' or sub == 'Ampere (1 phase)' then
+                d.updateCurrent(value)
+            elseif sub == 'Custom Sensor' then
+                d.updateCustomSensor(value)
+            elseif sub == 'kWh' then
+                d.updateElectricity(value, tonumber(d.WhTotal) or 0)
+            else
+                d.update(0, tostring(value)) -- generieke fallback
+            end
+        end
+
+        -- ---------------------------------------------------------------------
+        domoticz.log('Starten met ophalen van de gegevens via SEMS+...', domoticz.LOG_INFO)
+
+        -- 1. Wachtwoord versleutelen (MD5 hex -> Base64)
+        local safePw = semsPassword:gsub("'", "'\\''")
+        local cmdEncrypt = "printf '%s' '" .. safePw .. "' | md5sum | cut -d' ' -f1 | tr -d '\\n' | base64 | tr -d '\\n'"
+        local handleEnc = io.popen(cmdEncrypt)
+        local encryptedPassword = handleEnc:read('*a'):gsub('%s+', '')
+        handleEnc:close()
+
+        -- 2. Inloggen
+        local loginPayload = domoticz.utils.toJSON({
+            account = semsUser,
+            pwd = encryptedPassword,
+            isChinese = false,
+            agreement = 1,
+            isLocal = true
+        })
+
+        local cmdLogin = 'curl --silent --location --request POST "' .. loginUrl .. '" ' ..
+                         '--header "Content-Type: application/json" ' ..
+                         '--header "Accept: application/json, */*" ' ..
+                         '--header "token: {\\"uid\\":\\"\\",\\"timestamp\\":0,\\"token\\":\\"\\",\\"client\\":\\"semsPlusWeb\\",\\"version\\":\\"\\",\\"language\\":\\"en\\"}" ' ..
+                         "--data '" .. loginPayload .. "'"
+
+        local handleLogin = io.popen(cmdLogin)
+        local loginResult = handleLogin:read('*a')
+        handleLogin:close()
+
+        if (not loginResult or loginResult == '') then
+            domoticz.log('Geen netwerkrespons ontvangen van de inlogserver.', domoticz.LOG_ERROR)
+            return
+        end
+
+        local loginJson = domoticz.utils.fromJSON(loginResult)
+
+        if not (loginJson and loginJson.code == '00000' and loginJson.data) then
+            domoticz.log('Inloggen op SEMS+ geweigerd.', domoticz.LOG_ERROR)
+            return
+        end
+
+        local d = loginJson.data
+
+        local plantId = ''
+        if d.apiPlantPageDTOs then
+            plantId = d.apiPlantPageDTOs.pwId or ''
+        elseif d.station then
+            plantId = d.station.stationId or ''
+        end
+
+        local tokenHeader = domoticz.utils.toJSON({
+            uid = d.uid,
+            timestamp = d.timestamp,
+            token = d.token,
+            client = 'semsPlusWeb',
+            version = d.version or '',
+            language = d.language or 'en',
+            region = d.region or ''
+        })
+
+        -- 3. Data opvragen
+        local dataPayload = domoticz.utils.toJSON({
+            deviceTypeList = {'INVERTER'},
+            current = 1,
+            size = 10,
+            powerstationId = plantId,
+            pwId = plantId
+        })
+
+        local escapedToken = tokenHeader:gsub('"', '\\"')
+        local cmdData = 'curl --silent --location --request POST "' .. dataUrl .. '" ' ..
+                        '--header "Content-Type: application/json" ' ..
+                        '--header "Accept: application/json, */*" ' ..
+                        '--header "token: ' .. escapedToken .. '" ' ..
+                        "--data '" .. dataPayload .. "'"
+
+        local handleData = io.popen(cmdData)
+        local dataResult = handleData:read('*a')
+        handleData:close()
+
+        if (not dataResult or dataResult == '') then
+            domoticz.log('Geen data ontvangen van SEMS+.', domoticz.LOG_ERROR)
+            return
+        end
+
+        local file = io.open(saveFilePath, 'w')
+        if file then
+            file:write(tostring(dataResult))
+            file:close()
+        end
+
+        local dataJson = domoticz.utils.fromJSON(dataResult)
+
+        -- 4. Data-extractie
+        if not (dataJson and dataJson.code == '00000' and dataJson.data and dataJson.data.dataList) then
+            domoticz.log('Fout bij het uitlezen van de centralized page data block.', domoticz.LOG_ERROR)
+            return
+        end
+
+        local dataList = dataJson.data.dataList
+        if not (dataList[1] and dataList[1].children and dataList[1].children[1]) then
+            domoticz.log('Geen actieve omvormer gevonden binnen de dataList structure.', domoticz.LOG_ERROR)
+            return
+        end
+
+        local dev = dataList[1].children[1]
+
+        -- Hoofdgegevens
+        local pAc      = tonumber(dev.pAc) or 0
+        local proToday = tonumber(dev.proToday) or 0
+        local temp     = tonumber(dev.cavityTemperature) or 0
+        local status   = tonumber(dev.status) or 0
+
+        local wattActueel = math.floor(pAc * 1000)
+        local whVandaag   = math.floor(proToday * 1000)
+
+        domoticz.log('SEMS+ data: actueel ' .. wattActueel .. ' W | vandaag ' .. proToday .. ' kWh', domoticz.LOG_INFO)
+
+        -- 5. Updates in Domoticz
+
+        -- Status (selector switch)
+        if idxState and domoticz.devices(idxState) then
+            local selectorLevel = 0
+            if status == 5 or status == 1 then selectorLevel = 10   -- Online
+            elseif status == 2 then selectorLevel = 20              -- Storing
+            end
+            domoticz.devices(idxState).switchSelector(selectorLevel)
+        end
+
+        -- Temperatuur
+        if idxTemperatuur and domoticz.devices(idxTemperatuur) then
+            if not (skipMainWhenZero and temp <= 0) then
+                domoticz.devices(idxTemperatuur).updateTemperature(temp)
+            end
+        end
+
+        -- Hoofd kWh-teller: bij voorkeur levensduur-totaal (Wh), anders dagwaarde
+        if idxOutputPower and domoticz.devices(idxOutputPower) then
+            if not (skipMainWhenZero and wattActueel <= 0) then
+                local totalKwh = getValue(dev, 'total')
+                local whCounter
+                if totalKwh and totalKwh > 0 then
+                    whCounter = math.floor(totalKwh * 1000)
+                else
+                    whCounter = whVandaag
+                    domoticz.log('Geen levensduur-totaal gevonden; dagwaarde gebruikt (teller reset dagelijks).', domoticz.LOG_INFO)
+                end
+                domoticz.devices(idxOutputPower).updateElectricity(wattActueel, whCounter)
+            end
+        end
+
+        -- 6. Telemetry (detail) ophalen: spanningen, stromen, frequentie, strings
+        local sn     = dev.sn or inverterSN
+        local pwId   = dev.stationId or plantId
+        local telUrl = baseUrl .. '/web/sems/sems-plant/api/equipments/' .. sn ..
+                       '/telemetry?deviceType=INVERTER&pwId=' .. pwId
+
+        local telToken = domoticz.utils.toJSON({
+            uid = d.uid,
+            timestamp = d.timestamp,
+            token = d.token,
+            client = 'semsPlusWeb',
+            version = d.version or '',
+            language = d.language or 'en',
+            api = baseUrl .. '/web/sems',
+            region = d.region or ''
+        })
+        local escapedTelToken = telToken:gsub('"', '\\"')
+
+        local cmdTel = 'curl --silent --location --compressed "' .. telUrl .. '" ' ..
+                       '--header "Accept: application/json, text/plain, */*" ' ..
+                       '--header "Referer: https://semsplus.goodwe.com/" ' ..
+                       '--header "Origin: https://semsplus.goodwe.com" ' ..
+                       '--header "token: ' .. escapedTelToken .. '"'
+
+        local handleTel = io.popen(cmdTel)
+        local telResult = handleTel:read('*a')
+        handleTel:close()
+
+        local tel = nil
+        if telResult and telResult ~= '' then
+            local f = io.open(telemetryFilePath, 'w')
+            if f then f:write(tostring(telResult)); f:close() end
+
+            local telJson = domoticz.utils.fromJSON(telResult)
+            if telJson and telJson.code == '00000' and telJson.data then
+                tel = telJson.data
+            else
+                domoticz.log('Telemetry fout: code=' .. tostring(telJson and telJson.code) ..
+                             ' msg=' .. tostring(telJson and (telJson.msg or telJson.message)), domoticz.LOG_ERROR)
+            end
+        else
+            domoticz.log('Geen respons van telemetry endpoint.', domoticz.LOG_ERROR)
+        end
+
+        -- Telemetry is een lijst van groepen met factors {code, data, unit}: maak een code -> waarde map
+        local codeMap, codeLog = {}, {}
+        local codeUnit = {}
+        local function collect(t, depth)
+            if type(t) ~= 'table' or depth > 6 then return end
+            if t.code ~= nil and t.data ~= nil and type(t.data) ~= 'table' then
+                local c = tostring(t.code):lower()
+                codeMap[c] = toNum(t.data)
+                codeUnit[c] = t.unit
+                codeLog[#codeLog + 1] = tostring(t.code) .. '=' .. tostring(t.data) .. (t.unit and (' ' .. tostring(t.unit)) or '')
+            end
+            for _, v in pairs(t) do
+                if type(v) == 'table' then collect(v, depth + 1) end
+            end
+        end
+        collect(tel, 0)
+
+        local function getTel(key)
+            for _, name in ipairs(candidates[key]) do
+                local c = name:lower()
+                local v = codeMap[c]
+                if v ~= nil then
+                    if codeUnit[c] == 'kW' then v = v * 1000 end -- vermogen in Watt
+                    return v
+                end
+            end
+            missing[#missing + 1] = key
+            return nil
+        end
+
+        -- AC-uitgang
+        updateDevice(idxOutputVolt, getTel('outVolt'), 'AC voltage')
+        updateDevice(idxOutputAmp,  getTel('outAmp'),  'AC current')
+        updateDevice(idxFrequency,  getTel('freq'),    'Frequency')
+
+        -- DC-strings
+        for n = 1, numStrings do
+            local s = strings[n]
+            local v = getTel('volt' .. n)
+            local a = getTel('amp' .. n)
+            local p = getTel('power' .. n)
+            if (p == nil or p <= 0) and v and a and v > 0 and a > 0 then
+                p = v * a -- vermogen zelf berekenen als het niet in de JSON staat
+            end
+            updateDevice(s.volt,  v, 'String ' .. n .. ' voltage')
+            updateDevice(s.amp,   a, 'String ' .. n .. ' current')
+            updateDevice(s.power, p, 'String ' .. n .. ' power')
+        end
+
+        -- Diagnose: welke velden zijn niet gevonden?
+        if #missing > 0 then
+            domoticz.log('Niet gevonden in telemetry: ' .. table.concat(missing, ', '), domoticz.LOG_INFO)
+            domoticz.log('Telemetry codes: ' .. table.concat(codeLog, ' | '), domoticz.LOG_INFO)
+        end
+    end
+}
