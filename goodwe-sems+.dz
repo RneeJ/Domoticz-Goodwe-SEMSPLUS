@@ -1,7 +1,7 @@
 return {
     on = {
         timer = {
-            'every 1 minutes'
+            'every 5 minutes' -- take 5 minuts for operational, 1 minut for testing is good
         }
     },
     logging = {
